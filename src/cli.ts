@@ -82,6 +82,10 @@ program
     '--obo',
     'Enable On-Behalf-Of token exchange in HTTP mode. Exchanges the incoming bearer token for a Graph API token using the OBO flow. Requires MS365_MCP_CLIENT_SECRET.'
   )
+  .option(
+    '--trust-proxy-auth',
+    'In HTTP mode, skip the built-in Bearer-token check on /mcp and ignore any forwarded Authorization header. All callers share the locally cached MSAL identity (same path stdio mode uses). Use only when an upstream reverse proxy has already authenticated the caller.'
+  )
   .addOption(
     // DEPRECATED: kept only so existing deployments that set --base-url or
     // MS365_MCP_BASE_URL do not crash at startup. Use --public-url /
@@ -117,6 +121,7 @@ export interface CommandOptions {
   dynamicRegistration?: boolean;
   authBrowser?: boolean;
   obo?: boolean;
+  trustProxyAuth?: boolean;
   publicUrl?: string;
   /** @deprecated use publicUrl */
   baseUrl?: string;
@@ -254,6 +259,13 @@ export function parseArgs(): CommandOptions {
 
   if (process.env.MS365_MCP_OBO === 'true' || process.env.MS365_MCP_OBO === '1') {
     options.obo = true;
+  }
+
+  if (
+    process.env.MS365_MCP_TRUST_PROXY_AUTH === 'true' ||
+    process.env.MS365_MCP_TRUST_PROXY_AUTH === '1'
+  ) {
+    options.trustProxyAuth = true;
   }
 
   // Handle cloud type - CLI option takes precedence over environment variable

@@ -17,13 +17,16 @@ import { MicrosoftOAuthProvider } from './oauth-provider.js';
 import {
   exchangeCodeForToken,
   microsoftBearerTokenAuthMiddleware,
+  OAuthUpstreamError,
   refreshAccessToken,
+  toOAuthErrorResponse,
 } from './lib/microsoft-auth.js';
 import { isAllowedRedirectUri, parseAllowlist } from './lib/redirect-uri-validation.js';
 import type { CommandOptions } from './cli.ts';
 import { getSecrets, type AppSecrets } from './secrets.js';
 import { getCloudEndpoints } from './cloud-config.js';
 import { requestContext } from './request-context.js';
+import { dumpError } from './crash-logging.js';
 import crypto from 'node:crypto';
 import OboClient from './obo-client.js';
 
@@ -159,6 +162,11 @@ class MicrosoftGraphServer {
       if (!this.secrets.clientSecret) {
         throw new Error(
           '--obo requires MS365_MCP_CLIENT_SECRET to be set (confidential client required for On-Behalf-Of flow).'
+        );
+      }
+      if (this.options.trustProxyAuth) {
+        throw new Error(
+          '--obo cannot be combined with --trust-proxy-auth: the proxy-auth pass-through skips the incoming bearer token that OBO would exchange.'
         );
       }
       this.oboClient = new OboClient(this.secrets);
@@ -576,11 +584,18 @@ class MicrosoftGraphServer {
             });
           }
         } catch (error) {
-          logger.error('Token endpoint error:', error);
-          res.status(500).json({
-            error: 'server_error',
-            error_description: 'Internal server error during token exchange',
-          });
+          if (error instanceof OAuthUpstreamError) {
+            logger.warn('Token endpoint: upstream OAuth error surfaced to client', {
+              upstream_status: error.status,
+              error: error.body.error,
+              suberror: error.body.suberror,
+              error_codes: error.body.error_codes,
+            });
+          } else {
+            logger.error('Token endpoint error:', error);
+          }
+          const { status, body } = toOAuthErrorResponse(error);
+          res.status(status).json(body);
         }
       });
 
@@ -591,11 +606,15 @@ class MicrosoftGraphServer {
         })
       );
 
-      // Microsoft Graph MCP endpoints with bearer token auth
-      // Handle both GET and POST methods as required by MCP Streamable HTTP specification
+      // Microsoft Graph MCP endpoints with bearer token auth (or pass-through
+      // when --trust-proxy-auth is set; see microsoftBearerTokenAuthMiddleware
+      // for the AuthManager fallback that makes that mode work).
+      const mcpAuth = microsoftBearerTokenAuthMiddleware({
+        trustProxyAuth: this.options.trustProxyAuth,
+      });
       app.get(
         '/mcp',
-        microsoftBearerTokenAuthMiddleware,
+        mcpAuth,
         async (req: Request & { microsoftAuth?: { accessToken: string } }, res: Response) => {
           const handler = async () => {
             const server = this.createMcpServer();
@@ -640,7 +659,7 @@ class MicrosoftGraphServer {
 
       app.post(
         '/mcp',
-        microsoftBearerTokenAuthMiddleware,
+        mcpAuth,
         async (req: Request & { microsoftAuth?: { accessToken: string } }, res: Response) => {
           const handler = async () => {
             const server = this.createMcpServer();
@@ -709,6 +728,9 @@ class MicrosoftGraphServer {
       }
     } else {
       const transport = new StdioServerTransport();
+      transport.onerror = (error) => {
+        logger.error('Stdio transport error', { error: dumpError(error) });
+      };
       await this.server!.connect(transport);
       logger.info('Server connected to stdio transport');
     }
