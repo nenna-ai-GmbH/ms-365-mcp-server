@@ -20,6 +20,8 @@ interface Endpoint {
   method: string;
   scopes?: string[] | string[][];
   workScopes?: string[] | string[][];
+  returnDownloadUrl?: boolean;
+  llmTip?: string;
 }
 
 const endpoints: Endpoint[] = JSON.parse(
@@ -109,5 +111,36 @@ describe('endpoints.json validation', () => {
           `Run npm run generate, or check that the path and method exist in the OpenAPI spec.\n${details}`
       );
     }
+  });
+
+  it('should generate non-void response schemas for Planner task chat read/create tools', () => {
+    const plannerChatTools = ['list-planner-task-messages', 'create-planner-task-message'];
+
+    for (const toolName of plannerChatTools) {
+      const endpoint = betaApi.endpoints.find((e) => e.alias === toolName);
+      expect(endpoint, `${toolName} should exist in the beta generated client`).toBeDefined();
+      expect(
+        endpoint?.response.safeParse(undefined).success,
+        `${toolName} should parse the Graph response body instead of z.void()`
+      ).toBe(false);
+    }
+  });
+
+  it('should treat meeting recording content as authenticated bytes, not a pre-authenticated URL', () => {
+    const endpoint = endpoints.find((e) => e.toolName === 'get-meeting-recording-content');
+
+    expect(endpoint, 'get-meeting-recording-content should exist').toBeDefined();
+    expect(endpoint?.returnDownloadUrl).toBeUndefined();
+    expect(endpoint?.llmTip).toContain('authenticated meeting recording video bytes');
+    expect(endpoint?.llmTip).toContain('does not expose a pre-authenticated download URL');
+  });
+
+  it('should prefer get-download-url for out-of-band drive file downloads', () => {
+    const endpoint = endpoints.find((e) => e.toolName === 'get-drive-item');
+
+    expect(endpoint, 'get-drive-item should exist').toBeDefined();
+    expect(endpoint?.llmTip).toContain('call get-download-url');
+    expect(endpoint?.llmTip).toContain('out-of-band');
+    expect(endpoint?.llmTip).toContain('call download-bytes');
   });
 });

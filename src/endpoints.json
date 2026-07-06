@@ -359,6 +359,7 @@
     "toolName": "create-calendar-event",
     "presets": ["calendar", "outlook", "personal"],
     "scopes": ["Calendars.ReadWrite"],
+    "descriptionOverride": "Create (schedule) a new calendar event — a meeting or appointment — on the user's calendar. Set subject, start/end times, time zone, location, body, and attendees; supports online meetings and recurrence.",
     "llmTip": "CRITICAL: Do not try to guess the email address of the recipients. Use the list-users tool to find the email address of the recipients."
   },
   {
@@ -594,7 +595,7 @@
     "toolName": "get-drive-item",
     "presets": ["files", "onedrive", "personal"],
     "scopes": ["Files.Read"],
-    "llmTip": "Gets metadata for a file or folder: name, size, lastModifiedDateTime, createdBy, webUrl, file (mimeType, hashes), folder (childCount), parentReference, and @microsoft.graph.downloadUrl. For the bytes, call download-bytes with target=/drives/{drive-id}/items/{driveItem-id}/content (Graph redirects to the same downloadUrl)."
+    "llmTip": "Gets metadata for a file or folder: name, size, lastModifiedDateTime, createdBy, webUrl, file (mimeType, hashes), folder (childCount), parentReference, and @microsoft.graph.downloadUrl. For large drive/SharePoint files, call get-download-url with target=/drives/{drive-id}/items/{driveItem-id}/content to fetch out-of-band with no Authorization header. For small files where base64 in the tool response is acceptable, call download-bytes with the same /content target."
   },
   {
     "pathPattern": "/drives/{drive-id}/items/{driveItem-id}",
@@ -1166,6 +1167,30 @@
     "presets": ["tasks", "work"],
     "scopes": ["Tasks.ReadWrite"],
     "llmTip": "CRITICAL: Requires If-Match header with ETag from get-planner-bucket (use includeHeaders=true)."
+  },
+  {
+    "pathPattern": "/planner/tasks/{plannerTask-id}/messages",
+    "method": "get",
+    "toolName": "list-planner-task-messages",
+    "scopes": ["Tasks.Read"],
+    "apiVersion": "beta",
+    "llmTip": "Lists messages in a Planner task's chat — the modern Planner 'task chat', distinct from the legacy conversationThreadId comments (which live in the M365 group conversation thread). Each message has id, content (HTML), createdBy, createdDateTime, mentions, reactions. BETA Graph API: subject to change; delegated work/school accounts only — no application permissions, no personal Microsoft accounts, global cloud only (not GCC/DoD/21Vianet)."
+  },
+  {
+    "pathPattern": "/planner/tasks/{plannerTask-id}/messages",
+    "method": "post",
+    "toolName": "create-planner-task-message",
+    "scopes": ["Tasks.ReadWrite"],
+    "apiVersion": "beta",
+    "llmTip": "Posts a message to a Planner task's chat (the modern 'task chat', not the legacy conversationThreadId comment). Microsoft is retiring the classic task comments experience and hiding it from the task (Planner 2026 update), so task chat is the current supported way to post per-task updates teammates will see, with @mentions. Body: { content: 'plain text or sanitized HTML', mentions?: [{ mentioned: 'user-id', position: 0, mentionType: 'user' }] } (mentions optional). No ETag/If-Match required. BETA Graph API: subject to change; delegated work/school accounts only — no application permissions, no personal Microsoft accounts, global cloud only (not GCC/DoD/21Vianet)."
+  },
+  {
+    "pathPattern": "/planner/tasks/{plannerTask-id}/messages/{plannerTaskChatMessage-id}",
+    "method": "delete",
+    "toolName": "delete-planner-task-message",
+    "scopes": ["Tasks.ReadWrite"],
+    "apiVersion": "beta",
+    "llmTip": "Deletes a message from a Planner task's chat. No request body; If-Match is optional if you want conditional deletion; returns 204. BETA Graph API: subject to change; delegated work/school accounts only — no application permissions, no personal Microsoft accounts, global cloud only (not GCC/DoD/21Vianet)."
   },
   {
     "pathPattern": "/me/contacts",
@@ -1880,8 +1905,7 @@
     "toolName": "get-meeting-recording-content",
     "presets": ["teams", "work"],
     "workScopes": ["OnlineMeetingRecording.Read.All"],
-    "returnDownloadUrl": true,
-    "llmTip": "Returns a temporary download URL for the meeting recording in MP4 format. Use the download URL to access the video file. The recording may be large — do not attempt to stream it inline."
+    "llmTip": "Returns the authenticated meeting recording video bytes in MP4 format. The recording may be large; prefer out-of-band handling by the client when possible, but Microsoft Graph does not expose a pre-authenticated download URL for this resource."
   },
   {
     "pathPattern": "/me/onlineMeetings/{onlineMeeting-id}/attendanceReports",
