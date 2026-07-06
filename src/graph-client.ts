@@ -144,6 +144,12 @@ class GraphClient {
 
         if (text === '') {
           result = { message: 'OK!' };
+        } else if (options.rawResponse) {
+          // download-bytes on /content wants the body verbatim. A JSON body
+          // would otherwise round-trip through JSON.parse -> JSON.stringify,
+          // which is lossy (whitespace, trailing newline, key order, number
+          // formatting). Return the raw text instead. (issue #546)
+          result = { message: 'OK!', rawResponse: text };
         } else {
           try {
             result = JSON.parse(text);
@@ -278,7 +284,11 @@ class GraphClient {
       const removeODataProps = (obj: Record<string, unknown>): void => {
         if (typeof obj === 'object' && obj !== null) {
           Object.keys(obj).forEach((key) => {
-            if (key.startsWith('@odata.') && key !== '@odata.nextLink') {
+            if (
+              key.startsWith('@odata.') &&
+              key !== '@odata.nextLink' &&
+              key !== '@odata.deltaLink'
+            ) {
               delete obj[key];
             } else if (typeof obj[key] === 'object') {
               removeODataProps(obj[key] as Record<string, unknown>);
@@ -314,7 +324,11 @@ class GraphClient {
     const removeODataProps = (obj: Record<string, unknown>): void => {
       if (typeof obj === 'object' && obj !== null) {
         Object.keys(obj).forEach((key) => {
-          if (key.startsWith('@odata.') && key !== '@odata.nextLink') {
+          if (
+            key.startsWith('@odata.') &&
+            key !== '@odata.nextLink' &&
+            key !== '@odata.deltaLink'
+          ) {
             delete obj[key];
           } else if (typeof obj[key] === 'object') {
             removeODataProps(obj[key] as Record<string, unknown>);
