@@ -201,7 +201,9 @@ account features (email, calendar, OneDrive, etc.) are available.
 To access shared mailboxes, you need:
 
 1. **Organization mode**: Shared mailbox tools require `--org-mode` flag (work/school accounts only)
-2. **Delegated permissions**: `Mail.Read.Shared` or `Mail.Send.Shared` scopes
+2. **Delegated permissions**: `Mail.Read.Shared` to read, `Mail.ReadWrite.Shared` to create, update or move
+   messages, `Mail.Send.Shared` to send, reply or forward, and `Calendars.Read.Shared` for the shared calendar
+   tools
 3. **Exchange permissions**: The signed-in user must have been granted access to the shared mailbox
 4. **Usage**: Use the shared mailbox's email address as the `user-id` parameter in the shared mailbox tools
 
@@ -440,6 +442,11 @@ registration:
 
 With these configured, the server will use your custom Azure app instead of the built-in one.
 
+> **Note**: `.env` is read from the directory the server is started in, and the MCP client decides what
+> that is. Only `MS365_MCP_CLIENT_ID`, `MS365_MCP_CLIENT_SECRET`, `MS365_MCP_TENANT_ID` and
+> `MS365_MCP_CLOUD_TYPE` are read from it. Every other variable listed above must be set in your shell
+> or MCP client config; anything else found in a `.env` is ignored with a warning on stderr.
+
 #### 3. Bring Your Own Token (BYOT)
 
 If you are running ms-365-mcp-server as part of a larger system that manages Microsoft OAuth tokens externally, you can
@@ -625,11 +632,23 @@ Environment variables:
 
 ## Token Storage
 
-Authentication tokens are stored using the OS credential store (via keytar) when available. If keytar is not installed or fails (common on headless Linux), the server falls back to file-based storage.
+Authentication tokens are stored in an encrypted file (AES-256-GCM). Only the 32-byte encryption key goes to the OS credential store via keytar.
 
-**Default fallback paths** are relative to the installed package directory. This means tokens can be lost when the package is reinstalled or updated via npm.
+The cache itself is too big for some credential stores to hold - a Windows Credential Manager blob caps out at 2560 bytes and a real token cache is several times that, so on Windows the write could never succeed. A key is 32 bytes regardless of how many accounts are signed in, so this works the same way on every platform.
 
-To persist tokens across updates, set custom paths outside the package directory:
+**Default paths** are in the per-user config directory:
+
+| Platform | Location                                                                  |
+| -------- | ------------------------------------------------------------------------- |
+| Windows  | `%APPDATA%\ms-365-mcp-server\`                                            |
+| macOS    | `~/Library/Application Support/ms-365-mcp-server/`                        |
+| Linux    | `$XDG_CONFIG_HOME/ms-365-mcp-server/` (or `~/.config/ms-365-mcp-server/`) |
+
+Earlier versions defaulted to a path inside the installed package, which under `npx` resolves to a content-hashed cache directory that `npm cache clean` or a version bump throws away. A cache still sitting in the package directory is moved to the new location on first run.
+
+That covers global and local installs, and `npx` when the hash has not changed. It cannot reach a cache left behind in a _previous_ `npx` hash directory, so upgrading an `npx` install one last time means signing in again. Adopting a cache from another directory would mean trusting a directory this package cannot prove it wrote, which is not worth one saved sign-in.
+
+Override the paths if you need to:
 
 ```bash
 export MS365_MCP_TOKEN_CACHE_PATH="$HOME/.config/ms365-mcp/.token-cache.json"
@@ -638,7 +657,11 @@ export MS365_MCP_SELECTED_ACCOUNT_PATH="$HOME/.config/ms365-mcp/.selected-accoun
 
 Parent directories are created automatically. Files are written with `0600` permissions.
 
-> **Security note**: File-based token storage writes sensitive credentials to disk. Ensure the chosen directory has appropriate access controls. The OS credential store (keytar) is preferred when available.
+**Without a credential store** (headless Linux, most containers) the key is written to `.cache-key` next to the cache file, with `0600` permissions. That stops the tokens showing up in a stray `cat`, a backup or an accidental commit. It does not protect against anyone who can already read the directory - the key is right there. Use `MS365_MCP_AUTH_CACHE_COMMAND` below if you need the cache in a real secret store.
+
+If the cache cannot be decrypted - key lost, keychain locked, file modified - you are asked to sign in again rather than the server failing to start. The cache file is left exactly as it was: not deleted, and not overwritten by that new sign-in either. A keychain that is merely locked usually reads fine on the next start, and the cache is still there when it does.
+
+The cost is that the new session is not saved while this lasts, so each start asks you to sign in again. If the key is genuinely gone and the cache will never open, delete `.token-cache.json` to start over - the log says so, and names the path.
 
 > **Hosted/sandboxed environments** (e.g. Anthropic Cowork): Set `MS365_MCP_TOKEN_CACHE_PATH` and `MS365_MCP_SELECTED_ACCOUNT_PATH` to a persistent mount so tokens survive between sessions.
 
