@@ -26,6 +26,7 @@ import { TOOL_CATEGORIES } from './tool-categories.js';
 import { getRequestTokens } from './request-context.js';
 import { parseTeamsUrl } from './lib/teams-url-parser.js';
 import { buildBM25Index, scoreQuery, tokenize, type BM25Index } from './lib/bm25.js';
+import { deriveTargetResource, type AuditTargetResource } from './audit-target-resource.js';
 export interface DiscoverySearchIndex {
   bm25: BM25Index;
   nameTokens: Map<string, Set<string>>;
@@ -805,6 +806,12 @@ function registerUtilityToolWithMcp(
   );
 }
 
+// Every nested `body` field in the generated clients is an itemBody, so an @odata.type
+// naming it is the only one that belongs inside a body we just moved fields into
+function namesNestedBodyType(value: unknown): boolean {
+  return typeof value === 'string' && value.toLowerCase().endsWith('itembody');
+}
+
 // Dig out the object shape of a Body schema so flattened top-level params can be
 // matched against it (#569). z.lazy (chatMessage etc.) hides it behind _def.getter
 function bodySchemaShape(schema: z.ZodTypeAny | undefined): Record<string, unknown> | null {
@@ -898,6 +905,7 @@ async function executeGraphTool(
   const startTime = Date.now();
   const upn = getUserIdentityForAudit(getRequestTokens()?.accessToken);
   const httpMethod = tool.method.toUpperCase();
+  let targetResource: AuditTargetResource | undefined;
 
   try {
     const accountParam = params.account as string | undefined;
@@ -1089,18 +1097,61 @@ async function executeGraphTool(
       }
     }
 
+    // The client passed the nested itemBody's own fields as the whole request body - move
+    // them under the schema's `body` field (#620). Graph body schemas are all-optional, so
+    // the safeParse wrap in `case 'Body'` can't catch this: the inner itemBody parses clean
+    // as the outer type. A key only moves if it belongs to the nested field's own shape;
+    // being unknown to the outer shape means nothing, because generated schemas are trimmed
+    // subsets that passthrough real fields (message.isRead isn't in the shape). Keys are
+    // matched case-insensitively, and anything left behind stays top-level so a stray
+    // sibling can't cost us the repair - or get buried in the body and silently lost
+    if (
+      isPlainObject(body) &&
+      bodyShape != null &&
+      hasOwn(bodyShape, 'body') &&
+      !Object.keys(body).some((k) => k.toLowerCase() === 'body')
+    ) {
+      const nestedShape = bodySchemaShape(bodyShape.body as z.ZodTypeAny);
+      if (nestedShape != null) {
+        const nestedKeys = new Set(Object.keys(nestedShape).map((k) => k.toLowerCase()));
+        const outerKeys = new Set(Object.keys(bodyShape).map((k) => k.toLowerCase()));
+        // Null-prototype accumulators: a literal would route a '__proto__' key through the
+        // legacy setter, dropping the field instead of storing it
+        const nested: Record<string, unknown> = Object.create(null);
+        const kept: Record<string, unknown> = Object.create(null);
+        const annotations: Record<string, unknown> = Object.create(null);
+
+        for (const [key, value] of Object.entries(body)) {
+          const lower = key.toLowerCase();
+          if (key.startsWith('@')) {
+            // An annotation belongs to whatever it names, so only an @odata.type naming the
+            // nested type travels with the moved fields. An outer @odata.type (or an
+            // @odata.etag) describes the entity it is already on and stays put
+            if (lower === '@odata.type' && namesNestedBodyType(value)) {
+              annotations[key] = value;
+            } else {
+              kept[key] = value;
+            }
+          } else if (nestedKeys.has(lower) && !outerKeys.has(lower)) {
+            nested[key] = value;
+          } else {
+            kept[key] = value;
+          }
+        }
+
+        if (Object.keys(nested).length > 0) {
+          body = { ...kept, body: { ...nested, ...annotations } };
+          logger.info(
+            `Moved misplaced fields into nested 'body' for ${tool.alias}: ${Object.keys(nested).join(', ')}`
+          );
+        }
+      }
+    }
+
     if (Object.keys(strayBodyFields).length > 0) {
       if (isPlainObject(body)) {
-        // If none of body's keys are schema fields but the schema has a `body` field
-        // (message.body), the client meant it as that field - nest it. Spread order lets
-        // an explicit body win over stray duplicates in both branches
-        const keys = Object.keys(body);
-        const bodyIsNestedField =
-          bodyShape != null &&
-          hasOwn(bodyShape, 'body') &&
-          keys.length > 0 &&
-          keys.every((k) => !hasOwn(bodyShape, k));
-        body = bodyIsNestedField ? { ...strayBodyFields, body } : { ...strayBodyFields, ...body };
+        // Spread order lets an explicit body win over stray duplicates
+        body = { ...strayBodyFields, ...body };
         logger.info(`Merged flattened body fields: ${Object.keys(strayBodyFields).join(', ')}`);
       } else if (body == null) {
         body = strayBodyFields;
@@ -1234,6 +1285,11 @@ async function executeGraphTool(
     if (accountAccessToken) {
       options.accessToken = accountAccessToken;
     }
+
+    targetResource = deriveTargetResource({
+      pathPattern: config?.pathPattern ?? tool.path,
+      params,
+    });
 
     // Redact accessToken from log output to prevent credential leakage
     const { accessToken: _redacted, ...safeOptions } = options;
@@ -1380,6 +1436,7 @@ async function executeGraphTool(
       http_method: httpMethod,
       status: response.isError ? 'error' : 'success',
       duration_ms: Date.now() - startTime,
+      ...(targetResource ? { target_resource: targetResource } : {}),
     });
 
     return {
@@ -1398,6 +1455,7 @@ async function executeGraphTool(
       http_method: httpMethod,
       status: 'error',
       duration_ms: Date.now() - startTime,
+      ...(targetResource ? { target_resource: targetResource } : {}),
       error_type: err?.name || 'Error',
       error_code: err?.status ?? err?.code,
     });
