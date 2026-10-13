@@ -1,0 +1,11 @@
+# Container image vulnerability scanning.
+severity:
+  - CRITICAL
+  - HIGH
+  - MEDIUM
+  - LOW
+scan:
+  skip-dirs:
+    - .git
+    - .github
+    - .idea

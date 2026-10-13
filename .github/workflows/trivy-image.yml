@@ -1,0 +1,195 @@
+name: Trivy Image Scan
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trivy-image-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_REF: ms-365-mcp-server:ci
+
+jobs:
+  trivy:
+    runs-on: ubuntu-latest
+    outputs:
+      critical: ${{ steps.trivy_summary.outputs.critical }}
+      high: ${{ steps.trivy_summary.outputs.high }}
+      medium: ${{ steps.trivy_summary.outputs.medium }}
+      low: ${{ steps.trivy_summary.outputs.low }}
+      total: ${{ steps.trivy_summary.outputs.total }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image for scanning
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          tags: ${{ env.IMAGE_REF }}
+          build-args: |
+            BUILD_HASH=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Setup Trivy
+        uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514
+
+      - name: Run Trivy Image Scan
+        run: trivy image --config trivy.yaml --format table --exit-code 0 "$IMAGE_REF"
+
+      - name: Generate Trivy reports
+        if: always()
+        run: |
+          trivy image --config trivy.yaml --format json --output trivy-report.json --exit-code 0 "$IMAGE_REF"
+          trivy image --config trivy.yaml --format table --output trivy-report.txt --exit-code 0 "$IMAGE_REF"
+
+      - name: Summarize Trivy results
+        if: always()
+        id: trivy_summary
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          from collections import Counter
+          from pathlib import Path
+
+          counts = Counter()
+          report_path = Path("trivy-report.json")
+          if report_path.exists():
+              report = json.loads(report_path.read_text(encoding="utf-8"))
+              for result in report.get("Results", []) or []:
+                  for finding in result.get("Vulnerabilities") or []:
+                      counts[finding.get("Severity", "UNKNOWN")] += 1
+
+          total = sum(counts.values())
+          summary = [
+              "## Trivy Image",
+              "",
+              "| Severity | Count |",
+              "|----------|------:|",
+          ]
+          for severity in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"]:
+              if counts[severity]:
+                  summary.append(f"| {severity} | {counts[severity]} |")
+          if total == 0:
+              summary.append("| _(none)_ | 0 |")
+          summary.extend(
+              [
+                  "",
+                  f"Total findings: **{total}**",
+                  "",
+                  "Download `trivy-report.json` and `trivy-report.txt` from the workflow artifacts for full details.",
+              ]
+          )
+          Path(__import__("os").environ["GITHUB_STEP_SUMMARY"]).write_text(
+              "\n".join(summary) + "\n",
+              encoding="utf-8",
+          )
+
+          print(f"critical={counts['CRITICAL']}")
+          print(f"high={counts['HIGH']}")
+          print(f"medium={counts['MEDIUM']}")
+          print(f"low={counts['LOW']}")
+          print(f"total={total}")
+          PY
+
+      - name: Upload Trivy reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: trivy-report-${{ github.run_id }}
+          path: |
+            trivy-report.json
+            trivy-report.txt
+          retention-days: 30
+
+  security-summary:
+    needs: [trivy]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Post security CI summary
+        id: summary
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const results = {
+              trivy: '${{ needs.trivy.result }}',
+            };
+            const counts = {
+              trivyCritical: '${{ needs.trivy.outputs.critical }}' || '0',
+              trivyHigh: '${{ needs.trivy.outputs.high }}' || '0',
+              trivyMedium: '${{ needs.trivy.outputs.medium }}' || '0',
+              trivyLow: '${{ needs.trivy.outputs.low }}' || '0',
+              trivyTotal: '${{ needs.trivy.outputs.total }}' || '0',
+            };
+
+            const icon = (result) => {
+              if (result === 'success') return '✅';
+              if (result === 'skipped') return '⏭️';
+              return '❌';
+            };
+
+            const runUrl = `${context.payload.repository.html_url}/actions/runs/${context.runId}`;
+            const issueNumber = context.issue?.number ?? context.payload.pull_request?.number;
+
+            const body = [
+              '## Security CI Summary',
+              '',
+              '| Check | Status | Details |',
+              '|-------|--------|---------|',
+              `| Trivy image | ${icon(results.trivy)} ${results.trivy} | ${counts.trivyTotal} total (C:${counts.trivyCritical} H:${counts.trivyHigh} M:${counts.trivyMedium} L:${counts.trivyLow}) |`,
+              '',
+              'Reports are available as workflow artifacts and in the job summary on the workflow run page.',
+              '',
+              `- [Open workflow run](${runUrl})`,
+              '- Download `trivy-report.json` and `trivy-report.txt` from **Artifacts**',
+            ].join('\n');
+
+            const marker = '<!-- security-ci-summary -->';
+            const fullBody = `${marker}\n${body}`;
+
+            if (!issueNumber) {
+              core.info(`No pull request found (event=${context.eventName}); skipping summary comment.`);
+              return;
+            }
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+            });
+
+            const existing = comments.find((comment) => comment.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: fullBody,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: fullBody,
+              });
+            }
