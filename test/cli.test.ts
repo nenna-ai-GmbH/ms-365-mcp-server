@@ -1,3 +1,6 @@
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { parseArgs } from '../src/cli.js';
 
@@ -51,18 +54,85 @@ describe('CLI Module', () => {
     vi.clearAllMocks();
     commanderMocks.mockCommand.opts.mockReturnValue({ file: 'test.xlsx' });
     delete process.env.MS365_MCP_ALLOWED_SCOPES;
+    delete process.env.MS365_MCP_USER_FIELDS;
     delete process.env.MS365_MCP_EXTRA_SCOPES;
     delete process.env.MS365_MCP_EXPECTED_USERNAME;
     delete process.env.MS365_MCP_EXPECTED_HOME_ACCOUNT_ID;
     delete process.env.MS365_MCP_AUTH_CACHE_COMMAND;
+    delete process.env.MS365_MCP_BLOB_OUTPUT;
+    delete process.env.ENABLED_TOOLS;
+    delete process.env.ENABLED_TOOLS_FILE;
   });
 
   afterEach(() => {
     delete process.env.MS365_MCP_ALLOWED_SCOPES;
+    delete process.env.MS365_MCP_USER_FIELDS;
     delete process.env.MS365_MCP_EXTRA_SCOPES;
     delete process.env.MS365_MCP_EXPECTED_USERNAME;
     delete process.env.MS365_MCP_EXPECTED_HOME_ACCOUNT_ID;
     delete process.env.MS365_MCP_AUTH_CACHE_COMMAND;
+    delete process.env.MS365_MCP_HTTP_LOCAL_FILE_TOOLS;
+    delete process.env.MS365_MCP_BLOB_OUTPUT;
+    delete process.env.ENABLED_TOOLS;
+    delete process.env.ENABLED_TOOLS_FILE;
+  });
+
+  describe('eager tool configuration', () => {
+    afterEach(() => {
+      delete process.env.MS365_MCP_EAGER_TOOLS;
+    });
+    it('normalizes exact names and removes duplicates', () => {
+      commanderMocks.mockCommand.opts.mockReturnValue({
+        discovery: true,
+        eagerTools: ' list-mail-messages,send-mail,list-mail-messages ',
+      });
+      expect(parseArgs().eagerTools).toEqual(['list-mail-messages', 'send-mail']);
+    });
+    it('uses environment fallback and CLI precedence', () => {
+      process.env.MS365_MCP_EAGER_TOOLS = 'send-mail';
+      commanderMocks.mockCommand.opts.mockReturnValue({ discovery: true });
+      expect(parseArgs().eagerTools).toEqual(['send-mail']);
+      commanderMocks.mockCommand.opts.mockReturnValue({
+        discovery: true,
+        eagerTools: 'list-mail-messages',
+      });
+      expect(parseArgs().eagerTools).toEqual(['list-mail-messages']);
+    });
+    it('keeps file-based availability filtering independent of eager presentation', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'hybrid-filter-'));
+      const file = join(dir, 'tools.txt');
+      writeFileSync(file, '^list-mail-messages$\n');
+      commanderMocks.mockCommand.opts.mockReturnValue({
+        discovery: true,
+        enabledToolsFile: file,
+        eagerTools: 'list-mail-messages,send-mail',
+      });
+      const result = parseArgs();
+      expect(result.enabledTools).toBe('^list-mail-messages$');
+      expect(result.eagerTools).toEqual(['list-mail-messages', 'send-mail']);
+    });
+    it('treats empty environment interpolation as unset with or without discovery', () => {
+      for (const eager of ['', '   ']) {
+        process.env.MS365_MCP_EAGER_TOOLS = eager;
+        for (const discovery of [false, true]) {
+          commanderMocks.mockCommand.opts.mockReturnValue({ discovery });
+          expect(parseArgs().eagerTools).toBeUndefined();
+        }
+      }
+    });
+    it('does not treat an explicitly empty CLI option as an unset environment value', () => {
+      process.env.MS365_MCP_EAGER_TOOLS = 'list-mail-messages';
+      commanderMocks.mockCommand.opts.mockReturnValue({ discovery: true, eagerTools: '' });
+      expect(() => parseArgs()).toThrow('non-empty exact tool names');
+    });
+    it('requires discovery and rejects empty selections', () => {
+      commanderMocks.mockCommand.opts.mockReturnValue({ eagerTools: 'send-mail' });
+      expect(() => parseArgs()).toThrow('requires --discovery');
+      for (const eagerTools of ['', 'send-mail,', ' , ']) {
+        commanderMocks.mockCommand.opts.mockReturnValue({ discovery: true, eagerTools });
+        expect(() => parseArgs()).toThrow('non-empty exact tool names');
+      }
+    });
   });
 
   describe('parseArgs', () => {
@@ -77,6 +147,69 @@ describe('CLI Module', () => {
       const result = parseArgs();
 
       expect(result.allowedScopes).toBe('Mail.Read Files.Read');
+    });
+
+    it('should parse --user-fields from CLI options', () => {
+      commanderMocks.mockCommand.opts.mockReturnValue({ userFields: 'id,displayName,mail' });
+
+      expect(parseArgs().userFields).toBe('id,displayName,mail');
+    });
+
+    it('should use MS365_MCP_USER_FIELDS as a fallback', () => {
+      process.env.MS365_MCP_USER_FIELDS = 'id,displayName';
+      commanderMocks.mockCommand.opts.mockReturnValue({});
+
+      expect(parseArgs().userFields).toBe('id,displayName');
+    });
+
+    it('should fail closed when user fields are supplied empty', () => {
+      commanderMocks.mockCommand.opts.mockReturnValue({ userFields: '   ' });
+
+      parseArgs();
+
+      expect(console.error).toHaveBeenCalledWith(expect.stringContaining('--user-fields'));
+      expect(process.exit).toHaveBeenCalledWith(1);
+    });
+
+    it('should fail closed when user fields name no fields', () => {
+      commanderMocks.mockCommand.opts.mockReturnValue({ userFields: ' , ,' });
+
+      parseArgs();
+
+      expect(console.error).toHaveBeenCalledWith(expect.stringContaining('--user-fields'));
+      expect(process.exit).toHaveBeenCalledWith(1);
+    });
+
+    it.each(['true', '1'])(
+      'should enable --http-local-file-tools from MS365_MCP_HTTP_LOCAL_FILE_TOOLS=%s',
+      (value) => {
+        process.env.MS365_MCP_HTTP_LOCAL_FILE_TOOLS = value;
+        commanderMocks.mockCommand.opts.mockReturnValue({});
+
+        expect(parseArgs().httpLocalFileTools).toBe(true);
+      }
+    );
+
+    it('should leave --http-local-file-tools off by default', () => {
+      commanderMocks.mockCommand.opts.mockReturnValue({});
+
+      expect(parseArgs().httpLocalFileTools).toBeUndefined();
+    });
+
+    it('should fold --blob-output into MS365_MCP_BLOB_OUTPUT', () => {
+      commanderMocks.mockCommand.opts.mockReturnValue({ blobOutput: true });
+
+      parseArgs();
+
+      expect(process.env.MS365_MCP_BLOB_OUTPUT).toBe('true');
+    });
+
+    it('should leave MS365_MCP_BLOB_OUTPUT unset without --blob-output', () => {
+      commanderMocks.mockCommand.opts.mockReturnValue({});
+
+      parseArgs();
+
+      expect(process.env.MS365_MCP_BLOB_OUTPUT).toBeUndefined();
     });
 
     it('should use MS365_MCP_ALLOWED_SCOPES as a fallback', () => {
@@ -329,47 +462,248 @@ describe('CLI Module', () => {
     });
   });
 
-  describe('Dynamic Client Registration (DCR) — env var override', () => {
-    const prevDisableDcr = process.env.MS365_MCP_DISABLE_DCR;
+  describe('Dynamic Client Registration (DCR) flags', () => {
+    const prev = {
+      disable: process.env.MS365_MCP_DISABLE_DCR,
+      enable: process.env.MS365_MCP_ENABLE_DCR,
+    };
+
+    beforeEach(() => {
+      delete process.env.MS365_MCP_DISABLE_DCR;
+      delete process.env.MS365_MCP_ENABLE_DCR;
+    });
 
     afterEach(() => {
-      if (prevDisableDcr === undefined) delete process.env.MS365_MCP_DISABLE_DCR;
-      else process.env.MS365_MCP_DISABLE_DCR = prevDisableDcr;
+      for (const [name, value] of [
+        ['MS365_MCP_DISABLE_DCR', prev.disable],
+        ['MS365_MCP_ENABLE_DCR', prev.enable],
+      ] as const) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
     });
 
-    it('enables DCR by default in HTTP mode', () => {
-      delete process.env.MS365_MCP_DISABLE_DCR;
+    const dcrWith = (opts: Record<string, unknown>) => {
+      commanderMocks.mockCommand.opts.mockReturnValue(opts);
+      return parseArgs().enableDynamicRegistration;
+    };
+
+    it('is off by default in HTTP mode', () => {
+      expect(dcrWith({ http: '3000' })).toBe(false);
+    });
+
+    it('turns on with --enable-dynamic-registration', () => {
+      expect(dcrWith({ http: '3000', enableDynamicRegistration: true })).toBe(true);
+    });
+
+    it.each(['true', '1'])('turns on with MS365_MCP_ENABLE_DCR=%s', (value) => {
+      process.env.MS365_MCP_ENABLE_DCR = value;
+      expect(dcrWith({ http: '3000' })).toBe(true);
+    });
+
+    it('stays off when --no-dynamic-registration is also passed', () => {
+      expect(
+        dcrWith({ http: '3000', enableDynamicRegistration: true, dynamicRegistration: false })
+      ).toBe(false);
+    });
+
+    it.each(['true', '1'])('stays off when MS365_MCP_DISABLE_DCR=%s', (value) => {
+      process.env.MS365_MCP_DISABLE_DCR = value;
+      process.env.MS365_MCP_ENABLE_DCR = 'true';
+      expect(dcrWith({ http: '3000' })).toBe(false);
+    });
+
+    it('env vars have no effect outside HTTP mode', () => {
+      process.env.MS365_MCP_ENABLE_DCR = 'true';
+      expect(dcrWith({})).toBeUndefined();
+    });
+
+    it.each(['true', '1'])('turns CIMD off when MS365_MCP_DISABLE_CIMD=%s', (value) => {
+      const prevCimd = process.env.MS365_MCP_DISABLE_CIMD;
+      process.env.MS365_MCP_DISABLE_CIMD = value;
+      try {
+        commanderMocks.mockCommand.opts.mockReturnValue({ http: '3000' });
+        expect(parseArgs().clientMetadataDocuments).toBe(false);
+      } finally {
+        if (prevCimd === undefined) delete process.env.MS365_MCP_DISABLE_CIMD;
+        else process.env.MS365_MCP_DISABLE_CIMD = prevCimd;
+      }
+    });
+
+    it('leaves CIMD on by default', () => {
       commanderMocks.mockCommand.opts.mockReturnValue({ http: '3000' });
-      const result = parseArgs();
-      expect(result.enableDynamicRegistration).toBe(true);
+      expect(parseArgs().clientMetadataDocuments).toBeUndefined();
+    });
+  });
+
+  describe('--preset with --enable-attachment-urls', () => {
+    const allows = (tools: string | undefined, name: string) => new RegExp(tools!, 'i').test(name);
+
+    it.each(['mail', 'calendar', 'teams', 'mail,calendar'])(
+      'keeps get-download-url in --preset %s over HTTP so attachments can be minted',
+      (preset) => {
+        commanderMocks.mockCommand.opts.mockReturnValue({
+          preset,
+          http: '3000',
+          enableAttachmentUrls: true,
+        });
+        const { enabledTools } = parseArgs();
+        expect(allows(enabledTools, 'get-download-url')).toBe(true);
+        expect(allows(enabledTools, 'download-bytes')).toBe(true);
+        expect(allows(enabledTools, 'get-drive-item')).toBe(false);
+      }
+    );
+
+    it('leaves get-download-url out of a non-drive preset without the flag', () => {
+      commanderMocks.mockCommand.opts.mockReturnValue({ preset: 'mail', http: '3000' });
+      expect(allows(parseArgs().enabledTools, 'get-download-url')).toBe(false);
     });
 
-    it('disables DCR when MS365_MCP_DISABLE_DCR=true', () => {
-      process.env.MS365_MCP_DISABLE_DCR = 'true';
-      commanderMocks.mockCommand.opts.mockReturnValue({ http: '3000' });
-      const result = parseArgs();
-      expect(result.enableDynamicRegistration).toBe(false);
+    it('ignores the flag in stdio mode, where it has no effect', () => {
+      commanderMocks.mockCommand.opts.mockReturnValue({
+        preset: 'mail',
+        enableAttachmentUrls: true,
+      });
+      expect(allows(parseArgs().enabledTools, 'get-download-url')).toBe(false);
     });
 
-    it('disables DCR when MS365_MCP_DISABLE_DCR=1', () => {
-      process.env.MS365_MCP_DISABLE_DCR = '1';
-      commanderMocks.mockCommand.opts.mockReturnValue({ http: '3000' });
-      const result = parseArgs();
-      expect(result.enableDynamicRegistration).toBe(false);
+    it('adds get-download-url to teams-write,mail because mail lacks it', () => {
+      commanderMocks.mockCommand.opts.mockReturnValue({
+        preset: 'teams-write,mail',
+        http: '3000',
+        enableAttachmentUrls: true,
+      });
+      expect(allows(parseArgs().enabledTools, 'get-download-url')).toBe(true);
     });
 
-    it('CLI --no-dynamic-registration still wins over env var unset', () => {
-      delete process.env.MS365_MCP_DISABLE_DCR;
-      commanderMocks.mockCommand.opts.mockReturnValue({ http: '3000', dynamicRegistration: false });
-      const result = parseArgs();
-      expect(result.enableDynamicRegistration).toBe(false);
+    it.each(['files', 'all'])('adds no duplicate entry for --preset %s', (preset) => {
+      commanderMocks.mockCommand.opts.mockReturnValue({
+        preset,
+        http: '3000',
+        enableAttachmentUrls: true,
+      });
+      const { enabledTools } = parseArgs();
+      expect(enabledTools!.match(/get-download-url/g)?.length ?? 0).toBeLessThanOrEqual(1);
     });
 
-    it('env var has no effect outside HTTP mode', () => {
-      process.env.MS365_MCP_DISABLE_DCR = 'true';
+    it('lets ENABLED_TOOLS override the preset and the flag', () => {
+      process.env.ENABLED_TOOLS = '^list-mail-messages$';
+      commanderMocks.mockCommand.opts.mockReturnValue({
+        preset: 'mail',
+        http: '3000',
+        enableAttachmentUrls: true,
+      });
+      try {
+        expect(allows(parseArgs().enabledTools, 'get-download-url')).toBe(false);
+      } finally {
+        delete process.env.ENABLED_TOOLS;
+      }
+    });
+
+    it('does not add a byte reader to the send-only teams-write preset', () => {
+      commanderMocks.mockCommand.opts.mockReturnValue({
+        preset: 'teams-write',
+        http: '3000',
+        enableAttachmentUrls: true,
+      });
+      expect(allows(parseArgs().enabledTools, 'get-download-url')).toBe(false);
+    });
+  });
+
+  describe('--enabled-tools-file', () => {
+    const allows = (tools: string | undefined, name: string) => new RegExp(tools!, 'i').test(name);
+
+    function writeToolsFile(contents: string): string {
+      const dir = mkdtempSync(join(tmpdir(), 'cli-enabled-tools-'));
+      const path = join(dir, 'tools.txt');
+      writeFileSync(path, contents);
+      return path;
+    }
+
+    it('loads tool names from --enabled-tools-file', () => {
+      const path = writeToolsFile('list-mail-messages\nget-mail-message\n');
+      commanderMocks.mockCommand.opts.mockReturnValue({ enabledToolsFile: path });
+      const { enabledTools, enabledToolsFile } = parseArgs();
+      expect(enabledToolsFile).toBeUndefined();
+      expect(allows(enabledTools, 'list-mail-messages')).toBe(true);
+      expect(allows(enabledTools, 'get-mail-message')).toBe(true);
+      expect(allows(enabledTools, 'list-drives')).toBe(false);
+    });
+
+    it('lets --enabled-tools-file override --enabled-tools', () => {
+      const path = writeToolsFile('list-drives\n');
+      commanderMocks.mockCommand.opts.mockReturnValue({
+        enabledTools: '^list-mail-messages$',
+        enabledToolsFile: path,
+      });
+      const { enabledTools } = parseArgs();
+      expect(allows(enabledTools, 'list-drives')).toBe(true);
+      expect(allows(enabledTools, 'list-mail-messages')).toBe(false);
+    });
+
+    it('lets --preset override --enabled-tools-file', () => {
+      const path = writeToolsFile('list-drives\n');
+      commanderMocks.mockCommand.opts.mockReturnValue({
+        enabledToolsFile: path,
+        preset: 'mail',
+      });
+      const { enabledTools } = parseArgs();
+      expect(allows(enabledTools, 'list-mail-messages')).toBe(true);
+      expect(allows(enabledTools, 'list-drives')).toBe(false);
+    });
+
+    it('lets ENABLED_TOOLS_FILE override a preset', () => {
+      const path = writeToolsFile('list-drives\n');
+      process.env.ENABLED_TOOLS_FILE = path;
+      commanderMocks.mockCommand.opts.mockReturnValue({ preset: 'mail' });
+      const { enabledTools } = parseArgs();
+      expect(allows(enabledTools, 'list-drives')).toBe(true);
+      expect(allows(enabledTools, 'list-mail-messages')).toBe(false);
+    });
+
+    it('lets ENABLED_TOOLS_FILE override --enabled-tools', () => {
+      const path = writeToolsFile('list-drives\n');
+      process.env.ENABLED_TOOLS_FILE = path;
+      commanderMocks.mockCommand.opts.mockReturnValue({ enabledTools: '^list-mail-messages$' });
+      const { enabledTools } = parseArgs();
+      expect(allows(enabledTools, 'list-drives')).toBe(true);
+      expect(allows(enabledTools, 'list-mail-messages')).toBe(false);
+    });
+
+    it('lets ENABLED_TOOLS_FILE beat ENABLED_TOOLS', () => {
+      const path = writeToolsFile('list-drives\n');
+      process.env.ENABLED_TOOLS = '^list-mail-messages$';
+      process.env.ENABLED_TOOLS_FILE = path;
       commanderMocks.mockCommand.opts.mockReturnValue({});
-      const result = parseArgs();
-      expect(result.enableDynamicRegistration).toBeUndefined();
+      const { enabledTools } = parseArgs();
+      expect(allows(enabledTools, 'list-drives')).toBe(true);
+      expect(allows(enabledTools, 'list-mail-messages')).toBe(false);
+    });
+
+    it('fails when the file path is empty', () => {
+      commanderMocks.mockCommand.opts.mockReturnValue({ enabledToolsFile: '   ' });
+      parseArgs();
+      expect(console.error).toHaveBeenCalledWith(expect.stringContaining('could not read'));
+      expect(process.exit).toHaveBeenCalledWith(1);
+    });
+
+    it('fails when the file is missing', () => {
+      commanderMocks.mockCommand.opts.mockReturnValue({
+        enabledToolsFile: '/no/such/enabled-tools-file.txt',
+      });
+      parseArgs();
+      expect(console.error).toHaveBeenCalledWith(expect.stringContaining('could not read'));
+      expect(process.exit).toHaveBeenCalledWith(1);
+    });
+
+    it('rejects an invalid regex from the file via the shared enabled-tools check', () => {
+      const path = writeToolsFile('[invalid');
+      commanderMocks.mockCommand.opts.mockReturnValue({ enabledToolsFile: path });
+      parseArgs();
+      expect(console.error).toHaveBeenCalledWith(
+        expect.stringContaining('invalid --enabled-tools regex pattern')
+      );
+      expect(process.exit).toHaveBeenCalledWith(1);
     });
   });
 });

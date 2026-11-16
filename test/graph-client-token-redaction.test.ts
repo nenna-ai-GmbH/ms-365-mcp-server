@@ -21,6 +21,7 @@ describe('graphRequest logging (#601)', () => {
       headers: new Headers({ 'content-type': 'application/json' }),
       json: async () => ({ value: [] }),
       text: async () => '{"value":[]}',
+      arrayBuffer: async () => new TextEncoder().encode('{"value":[]}').buffer,
     }) as unknown as typeof fetch;
 
     client = new GraphClient(
@@ -55,6 +56,6 @@ describe('graphRequest logging (#601)', () => {
 
     const line = loggedLines().find((l) => l.startsWith('Calling /me/todo/lists'));
     expect(line).not.toContain('REDACTED');
-    expect(line).toContain('"method":"GET"');
+    expect(line).toContain('[GET]');
   });
 });
