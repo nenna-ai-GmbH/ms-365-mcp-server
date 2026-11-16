@@ -356,7 +356,7 @@ describe('graph-tools', () => {
         method: 'post',
         path: '/$batch',
         alias: 'graph-batch',
-        parameters: [{ name: 'body', type: 'Body', schema: z.object({}).passthrough() }],
+        parameters: [{ name: 'body', type: 'Body', schema: z.object({}).loose() }],
       });
       const config = makeConfig({
         pathPattern: '/$batch',
@@ -566,9 +566,9 @@ describe('graph-tools', () => {
 
         const [payload] = auditLogMock.mock.calls[0];
         expect(payload.result_count).toBe(2);
-        // Truncated at the cap: the merged body drops @odata.nextLink, so the
-        // audit event is the only place Graph-has-more survives.
-        expect(JSON.parse(result.content[0].text)['@odata.nextLink']).toBeUndefined();
+        expect(JSON.parse(result.content[0].text)['@odata.nextLink']).toBe(
+          'https://graph.microsoft.com/v1.0/me/messages?$skip=2'
+        );
         expect(payload.result_has_more).toBe(true);
         expect(payload.response_bytes).toBe(100);
       } finally {
@@ -691,7 +691,7 @@ describe('graph-tools', () => {
         method: 'post',
         path: '/me/messages',
         alias: 'create-draft-email',
-        parameters: [{ name: 'body', type: 'Body', schema: z.object({}).passthrough() }],
+        parameters: [{ name: 'body', type: 'Body', schema: z.object({}).loose() }],
       });
       const config = makeConfig({
         pathPattern: '/me/messages',
@@ -838,7 +838,7 @@ describe('graph-tools', () => {
             {
               name: 'body',
               type: 'Body',
-              schema: z.object({ message: z.object({}).passthrough() }),
+              schema: z.object({ message: z.object({}).loose() }),
             },
           ],
         })
@@ -1397,21 +1397,21 @@ describe('graph-tools', () => {
     });
 
     it.each(['list-calendar-events-delta', 'list-calendar-view-delta'])(
-      'ignores stale mixed-case top values for %s',
+      'rejects mixed-case top values before Graph dispatch for %s',
       async (alias) => {
         mockEndpoints.push(makeEndpoint({ alias }));
-        mockEndpointsJson = [makeConfig({ toolName: alias })];
+        mockEndpointsJson = [
+          makeConfig({ toolName: alias, queryParams: ['startDateTime', 'skiptoken'] }),
+        ];
         const graphClient = createMockGraphClient();
         const server = createMockServer();
         const { registerGraphTools } = await loadModule();
         registerGraphTools(server as any, graphClient as any);
         for (const key of ['top', '$top', 'TOP', '$TOP', '$Top']) {
-          await server.tools.get(alias)!.handler({ [key]: 10 });
+          const result = await server.tools.get(alias)!.handler({ [key]: 10 });
+          expect(result.isError).toBe(true);
         }
-        expect(graphClient.graphRequest).toHaveBeenCalledTimes(5);
-        for (const call of graphClient.graphRequest.mock.calls) {
-          expect(JSON.stringify(call)).not.toContain('$top');
-        }
+        expect(graphClient.graphRequest).not.toHaveBeenCalled();
       }
     );
 
@@ -1419,7 +1419,7 @@ describe('graph-tools', () => {
       'rejects unsupported query options before Graph dispatch for %s',
       async (alias) => {
         mockEndpoints.push(makeEndpoint({ alias }));
-        mockEndpointsJson = [makeConfig({ toolName: alias })];
+        mockEndpointsJson = [makeConfig({ toolName: alias, queryParams: [] })];
         const graphClient = createMockGraphClient();
         const server = createMockServer();
         const { registerGraphTools } = await loadModule();
@@ -1435,7 +1435,7 @@ describe('graph-tools', () => {
 
     it('rejects oversized chat pages before Graph dispatch, including dollar-prefixed input', async () => {
       mockEndpoints.push(makeEndpoint({ alias: 'list-chats' }));
-      mockEndpointsJson = [makeConfig({ toolName: 'list-chats' })];
+      mockEndpointsJson = [makeConfig({ toolName: 'list-chats', maxTop: 50 })];
       const graphClient = createMockGraphClient();
       const server = createMockServer();
       const { registerGraphTools } = await loadModule();
@@ -1448,7 +1448,7 @@ describe('graph-tools', () => {
     });
 
     it('sends a calendar field array as comma-separated text in one Graph request', async () => {
-      const alias = 'list-calendar-events-delta';
+      const alias = 'list-calendar-events';
       mockEndpoints.push(makeEndpoint({ alias }));
       mockEndpointsJson = [makeConfig({ toolName: alias })];
       const graphClient = createMockGraphClient();
@@ -1515,8 +1515,8 @@ describe('graph-tools', () => {
     });
 
     it('keeps skiptoken on delta tools that have $top stripped', async () => {
-      // list-calendar-events-delta pages via cursor but is in TOP_UNSUPPORTED_DELTA_TOOLS,
-      // so a $top-only test would strip the cursor from an endpoint that needs it.
+      // list-calendar-events-delta pages via cursor but supports none of the collection
+      // options, so guessing from the schema alone would strip the cursor it needs.
       const endpoint = makeEndpoint({
         alias: 'list-calendar-events-delta',
         path: '/me/calendarView/delta',
@@ -1526,6 +1526,7 @@ describe('graph-tools', () => {
         makeConfig({
           toolName: 'list-calendar-events-delta',
           pathPattern: '/me/calendarView/delta',
+          queryParams: ['startDateTime', 'skiptoken'],
         })
       );
 
@@ -1687,6 +1688,171 @@ describe('graph-tools', () => {
       expect(path).toContain('$filter=');
       expect(path).toContain('$top=5');
       expect(path).toContain('$skiptoken=tok');
+    });
+
+    it('points a deltaToken tool at token when skiptoken gets a token= link', async () => {
+      mockEndpoints.push(makeEndpoint({ alias: 'drive-delta', path: '/me/drive/delta()' }));
+      mockEndpointsJson = [
+        makeConfig({ toolName: 'drive-delta', pathPattern: '/me/drive/delta()', deltaToken: true }),
+      ];
+      const graphClient = createMockGraphClient();
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const result = await server.tools.get('drive-delta')!.handler({
+        skiptoken: 'https://graph.microsoft.com/v1.0/me/drive/delta?token=abc',
+      });
+
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toBe('invalid_skiptoken');
+      expect(payload.message).toContain('pass that link as token');
+      expect(graphClient.graphRequest).not.toHaveBeenCalled();
+    });
+  });
+
+  // ---- 2a2. token= delta paging ----
+  describe('delta token', () => {
+    const deltaEndpoint = () =>
+      makeEndpoint({
+        alias: 'items-delta',
+        path: '/sites/:siteId/lists/:listId/items/delta()',
+        parameters: [
+          { name: 'select', type: 'Query', schema: z.string().optional() },
+          { name: 'expand', type: 'Query', schema: z.string().optional() },
+          { name: 'top', type: 'Query', schema: z.number().optional() },
+        ],
+      });
+
+    const register = async (deltaToken: boolean | undefined) => {
+      mockEndpoints.push(deltaEndpoint());
+      mockEndpointsJson = [
+        makeConfig({
+          toolName: 'items-delta',
+          pathPattern: '/sites/{site-id}/lists/{list-id}/items/delta()',
+          queryParams: ['select', 'expand', 'top'],
+          ...(deltaToken === undefined ? {} : { deltaToken }),
+        }),
+      ];
+      const graphClient = createMockGraphClient();
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+      return { server, graphClient };
+    };
+
+    const callForResult = async (args: Record<string, unknown>) => {
+      const { server, graphClient } = await register(true);
+      const result = await server.tools.get('items-delta')!.handler({
+        siteId: 's1',
+        listId: 'l1',
+        ...args,
+      });
+      return { result, graphClient };
+    };
+
+    /** The request path the tool sent to Graph. */
+    const callWith = async (args: Record<string, unknown>) => {
+      const { result, graphClient } = await callForResult(args);
+      expect(result.isError).not.toBe(true);
+      return graphClient.graphRequest.mock.calls[0][0] as string;
+    };
+
+    it('advertises token on a deltaToken tool', async () => {
+      const { server } = await register(true);
+      expect(server.tools.get('items-delta')!.schema.token).toBeDefined();
+    });
+
+    it.each([undefined, false])('omits token when deltaToken is %s', async (flag) => {
+      const { server } = await register(flag);
+      expect(server.tools.get('items-delta')!.schema.token).toBeUndefined();
+    });
+
+    it('shows token in discovery mode only on a deltaToken tool', async () => {
+      const { describeToolSchema } = await import('../lib/tool-schema.js');
+      const names = (deltaToken?: boolean) =>
+        describeToolSchema(deltaEndpoint() as any, {
+          queryParams: ['select', 'expand', 'top'],
+          deltaToken,
+        }).parameters.map((p) => p.name);
+      expect(names(true)).toContain('token');
+      expect(names()).not.toContain('token');
+    });
+
+    it('sends a bare token as token=', async () => {
+      const path = await callWith({ token: 'abc123' });
+      expect(path).toBe('/sites/s1/lists/l1/items/delta()?token=abc123');
+    });
+
+    it('sends latest as token=latest', async () => {
+      const path = await callWith({ token: 'latest' });
+      expect(path).toContain('?token=latest');
+    });
+
+    it('reads the token out of a whole @odata.deltaLink', async () => {
+      const path = await callWith({
+        token:
+          'https://graph.microsoft.com/v1.0/sites/s1/lists/l1/items/delta?token=MzslMjM0OyUyMzE7Mw',
+      });
+      expect(path).toBe('/sites/s1/lists/l1/items/delta()?token=MzslMjM0OyUyMzE7Mw');
+    });
+
+    it('reads the token out of a @odata.nextLink with params after it', async () => {
+      const path = await callWith({
+        token: 'https://graph.microsoft.com/v1.0/sites/s1/lists/l1/items/delta?token=tok1&$top=5',
+        top: 5,
+      });
+      expect(path).toContain('token=tok1');
+      expect(path).not.toContain('tok1%26');
+      expect(path).not.toContain('graph.microsoft.com');
+    });
+
+    it.each([
+      ['token=tok1', 'tok1'],
+      ["https://graph.microsoft.com/v1.0/me/drive/root/delta(token='tok1')", 'tok1'],
+      ["https://graph.microsoft.com/v1.0/me/drive/root/delta?(token='tok1')", 'tok1'],
+      ['https://graph.microsoft.com/v1.0/me/drive/delta(token=tok1)', 'tok1'],
+    ])('reads the token out of %s', async (value, expected) => {
+      const path = await callWith({ token: value });
+      expect(path).toContain(`?token=${expected}`);
+      expect(path).not.toContain("'");
+    });
+
+    it('percent-decodes a token copied out of a link once, so it is not encoded twice', async () => {
+      const path = await callWith({
+        token: 'https://graph.microsoft.com/v1.0/sites/delta?token=a%2Bb%3D%3D',
+      });
+      expect(path).toContain('token=a%2Bb%3D%3D');
+      expect(path).not.toContain('%25');
+    });
+
+    it('does not read a $deltatoken or $skiptoken as token=', async () => {
+      const path = await callWith({
+        token: 'https://graph.microsoft.com/v1.0/sites/delta?$deltatoken=dt1',
+      });
+      expect(path).toContain('$deltatoken=dt1');
+      expect(path).not.toContain('?token=');
+    });
+
+    it.each(['', '   '])('sends no token when blank (%j)', async (blank) => {
+      const path = await callWith({ token: blank });
+      expect(path).not.toContain('token');
+    });
+
+    it.each([
+      'https://graph.microsoft.com/v1.0/sites/s1/lists/l1/items/delta?$top=5',
+      'https://graph.microsoft.com/v1.0/sites/s1/lists/l1/items/delta?token=&$top=5',
+    ])('refuses a link with no token to resume from: %s', async (link) => {
+      const { result, graphClient } = await callForResult({ token: link });
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content[0].text).error).toBe('invalid_delta_token');
+      expect(graphClient.graphRequest).not.toHaveBeenCalled();
+    });
+
+    it('drops token on a tool without deltaToken', async () => {
+      const { server, graphClient } = await register(undefined);
+      await server.tools.get('items-delta')!.handler({ siteId: 's1', listId: 'l1', token: 'x' });
+      expect(graphClient.graphRequest.mock.calls[0][0]).not.toContain('token');
     });
   });
 
@@ -2783,6 +2949,33 @@ describe('graph-tools', () => {
       // the Content-Type Graph reports (application/msword is not on the allowlist).
       expect(options.forceBinary).toBe(true);
       expect(options.rawResponse).toBe(true);
+      expect(options.blobOutput).toBeUndefined();
+      expect(options.maxBytes).toBeUndefined();
+    });
+
+    it('asks for a capped blob resource when blob output is on', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+      process.env.MS365_MCP_BLOB_OUTPUT = 'true';
+      process.env.MS365_MCP_BLOB_MAX_BYTES = '1234';
+      try {
+        const graphClient = { graphRequest: vi.fn().mockResolvedValue({ content: [] }) };
+        const server = createMockServer();
+        const { registerGraphTools } = await loadModule();
+        registerGraphTools(server as any, graphClient as any);
+
+        await server.tools
+          .get('download-bytes')!
+          .handler({ target: '/me/messages/m1/attachments/a1/$value', fileName: 'drawing.pdf' });
+
+        const [, options] = graphClient.graphRequest.mock.calls[0];
+        expect(options.forceBinary).toBe(true);
+        expect(options.maxBytes).toBe(1234);
+        expect(options.blobOutput).toEqual({ fileName: 'drawing.pdf' });
+      } finally {
+        delete process.env.MS365_MCP_BLOB_OUTPUT;
+        delete process.env.MS365_MCP_BLOB_MAX_BYTES;
+      }
     });
 
     it('rejects absolute URLs (Graph paths only)', async () => {
@@ -5070,6 +5263,382 @@ describe('graph-tools', () => {
       const { isDestructiveOperation } = await loadModule();
       expect(isDestructiveOperation('PATCH', { readOnly: true } as any)).toBe(true);
       expect(isDestructiveOperation('DELETE', { readOnly: true } as any)).toBe(true);
+    });
+  });
+
+  describe('rewriteMentionShorthand', () => {
+    const U1 = '11111111-2222-3333-4444-555555555555';
+    const U2 = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const html = (content: string, extra: Record<string, unknown> = {}) => ({
+      body: { contentType: 'html', content },
+      ...extra,
+    });
+    const mention = (id: number, userId: string, name: string) => ({
+      id,
+      mentionText: name,
+      mentioned: { user: { id: userId, displayName: name, userIdentityType: 'aadUser' } },
+    });
+
+    it('rewrites one tag and builds the mentions array', async () => {
+      const { rewriteMentionShorthand } = await loadModule();
+      expect(rewriteMentionShorthand(html(`Hi <at user-id="${U1}">Jane Doe</at>!`)).body).toEqual(
+        html('Hi <at id="0">Jane Doe</at>!', { mentions: [mention(0, U1, 'Jane Doe')] })
+      );
+    });
+
+    it('numbers several tags in order, including a repeated user', async () => {
+      const { rewriteMentionShorthand } = await loadModule();
+      const out = rewriteMentionShorthand(
+        html(
+          `<at user-id="${U1}">Jane</at> <at user-id="${U2}">Bob</at> <at user-id="${U1}">Jane</at>`
+        )
+      ).body as any;
+      expect(out.body.content).toBe(
+        '<at id="0">Jane</at> <at id="1">Bob</at> <at id="2">Jane</at>'
+      );
+      expect(out.mentions.map((m: any) => m.id)).toEqual([0, 1, 2]);
+    });
+
+    it('starts above ids already in the content and mentions', async () => {
+      const { rewriteMentionShorthand } = await loadModule();
+      const input = html(`<at id="0">Old</at> <at user-id="${U1}">Jane</at>`, {
+        mentions: [mention(0, U2, 'Old')],
+      });
+      const out = rewriteMentionShorthand(input).body as any;
+      expect(out.body.content).toBe('<at id="0">Old</at> <at id="1">Jane</at>');
+      expect(out.mentions).toEqual([mention(0, U2, 'Old'), mention(1, U1, 'Jane')]);
+    });
+
+    it('passes a correct hand-built body through unchanged', async () => {
+      const { rewriteMentionShorthand } = await loadModule();
+      const input = html('<at id="0">Jane</at>', { mentions: [mention(0, U1, 'Jane')] });
+      expect(rewriteMentionShorthand(input).body).toBe(input);
+    });
+
+    it('returns an error for a user-id that is not a GUID', async () => {
+      const { rewriteMentionShorthand } = await loadModule();
+      const input = html('<at user-id="jane@contoso.com">Jane</at>');
+      const out = rewriteMentionShorthand(input);
+      expect(out.error).toContain('jane@contoso.com');
+      expect(out.body).toBe(input);
+    });
+
+    it('leaves non-html content without the shorthand alone', async () => {
+      const { rewriteMentionShorthand } = await loadModule();
+      const text = { body: { contentType: 'text', content: 'plain words' } };
+      const bare = { body: { content: 'plain words' } };
+      expect(rewriteMentionShorthand(text).body).toBe(text);
+      expect(rewriteMentionShorthand(bare).body).toBe(bare);
+    });
+
+    it.each([
+      ['text', { contentType: 'text' }],
+      ['missing', {}],
+    ])('returns an error for the shorthand when contentType is %s', async (_label, type) => {
+      const { rewriteMentionShorthand } = await loadModule();
+      const input = { body: { ...type, content: `<at user-id="${U1}">Jane</at>` } };
+      const out = rewriteMentionShorthand(input);
+      expect(out.error).toContain('contentType');
+      expect(out.body).toBe(input);
+    });
+
+    it.each([
+      ['single-quoted user-id', `<at user-id='${U1}'>Jane</at>`],
+      ['spaces around =', `<at user-id = "${U1}">Jane</at>`],
+      ['an extra attribute', `<at user-id="${U1}" class="x">Jane</at>`],
+      ['nested markup in the name', `<at user-id="${U1}"><b>Jane</b></at>`],
+    ])('returns an error for an unsupported tag form: %s', async (_label, tag) => {
+      const { rewriteMentionShorthand } = await loadModule();
+      const input = html(`Hi ${tag}`);
+      const out = rewriteMentionShorthand(input);
+      expect(out.error).toContain('Unsupported mention tag form');
+      expect(out.body).toBe(input);
+    });
+
+    it('leaves a raw string body alone', async () => {
+      const { rewriteMentionShorthand } = await loadModule();
+      expect(rewriteMentionShorthand('{"body":{}}').body).toBe('{"body":{}}');
+      expect(rewriteMentionShorthand(null).body).toBeNull();
+    });
+
+    it('keeps the display name verbatim', async () => {
+      const { rewriteMentionShorthand } = await loadModule();
+      const out = rewriteMentionShorthand(html(`<at user-id="${U1}">Smith &amp; Co</at>`))
+        .body as any;
+      expect(out.body.content).toBe('<at id="0">Smith &amp; Co</at>');
+      expect(out.mentions[0].mentionText).toBe('Smith &amp; Co');
+    });
+  });
+
+  describe('mention shorthand (tool wiring)', () => {
+    const U1 = '11111111-2222-3333-4444-555555555555';
+    const aliases = [
+      ['send-channel-message', 'post'],
+      ['reply-to-channel-message', 'post'],
+      ['update-channel-message', 'patch'],
+      ['update-channel-message-reply', 'patch'],
+      ['send-chat-message', 'post'],
+      ['reply-to-chat-message', 'post'],
+      ['update-chat-message', 'patch'],
+    ] as const;
+
+    async function call(alias: string, method: string, body: unknown, flagged = true) {
+      mockEndpoints.push(
+        makeEndpoint({
+          alias,
+          method,
+          path: '/chats/{chat-id}/messages',
+          parameters: [{ name: 'body', type: 'Body', schema: z.object({}).loose() }],
+        })
+      );
+      mockEndpointsJson = [
+        makeConfig({
+          toolName: alias,
+          method,
+          pathPattern: '/chats/{chat-id}/messages',
+          mentionShorthand: flagged,
+        }),
+      ];
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ id: 'm1' }) }] },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+      const result = await server.tools
+        .get(alias)!
+        .handler({ 'chat-id': 'c1', body, confirm: true });
+      return { result, graphClient };
+    }
+    const sent = (graphClient: any) => JSON.parse(graphClient.graphRequest.mock.calls[0][1].body);
+
+    it.each(aliases)('rewrites the shorthand on %s', async (alias, method) => {
+      const { graphClient } = await call(alias, method, {
+        body: { contentType: 'html', content: `Hi <at user-id="${U1}">Jane</at>` },
+      });
+      const out = sent(graphClient);
+      expect(out.body.content).toBe('Hi <at id="0">Jane</at>');
+      expect(out.mentions).toEqual([
+        {
+          id: 0,
+          mentionText: 'Jane',
+          mentioned: { user: { id: U1, displayName: 'Jane', userIdentityType: 'aadUser' } },
+        },
+      ]);
+    });
+
+    it('returns a tool error and sends nothing for a bad user-id', async () => {
+      const { result, graphClient } = await call('send-chat-message', 'post', {
+        body: { contentType: 'html', content: '<at user-id="jane">Jane</at>' },
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('not an Entra object id');
+      expect(graphClient.graphRequest).not.toHaveBeenCalled();
+    });
+
+    it('does not rewrite on a tool without mentionShorthand', async () => {
+      const { graphClient } = await call(
+        'create-draft-email',
+        'post',
+        { body: { contentType: 'html', content: `<at user-id="${U1}">Jane</at>` } },
+        false
+      );
+      expect(sent(graphClient).body.content).toBe(`<at user-id="${U1}">Jane</at>`);
+    });
+
+    it('lists only tools that exist in endpoints.json and documents the shorthand', async () => {
+      // fs is mocked above to serve mockEndpointsJson for this path; read the real file
+      const actualFs = await vi.importActual<typeof import('fs')>('fs');
+      const endpoints = JSON.parse(
+        actualFs.readFileSync(join(__dirname, '..', 'endpoints.json'), 'utf8')
+      ) as Array<{ toolName: string; llmTip?: string }>;
+      for (const [alias] of aliases) {
+        const entry = endpoints.find((e) => e.toolName === alias);
+        expect(entry, alias).toBeDefined();
+        const tip = entry!.llmTip!;
+        expect(tip, alias).toContain('user-id=');
+        // the name param ships in a separate PR; this one must stand alone
+        expect(tip, alias).not.toContain('name param');
+        // conversationMember has both id (membership id) and userId (the GUID)
+        expect(tip, alias).toContain('userId');
+        // the raw form is the fallback, not a second copy of the same instruction
+        expect(tip.split('To @mention someone').length - 1, alias).toBe(1);
+      }
+    });
+  });
+
+  describe('filterMembersByName', () => {
+    const body = {
+      value: [
+        { id: '1', displayName: 'Jane Doe', email: 'jane@contoso.com' },
+        { id: '2', displayName: 'John Smith', email: 'jsmith@contoso.com' },
+        { id: '3', displayName: null, email: null },
+      ],
+      '@odata.count': 3,
+    };
+    const ids = (r: any) => r.value.map((m: any) => m.id);
+
+    it('matches displayName case-insensitively', async () => {
+      const { filterMembersByName } = await loadModule();
+      expect(ids(filterMembersByName(body, 'JANE'))).toEqual(['1']);
+    });
+
+    it('matches email', async () => {
+      const { filterMembersByName } = await loadModule();
+      expect(ids(filterMembersByName(body, 'jsmith@'))).toEqual(['2']);
+    });
+
+    it('returns an empty value array when nothing matches', async () => {
+      const { filterMembersByName } = await loadModule();
+      expect(ids(filterMembersByName(body, 'zzz'))).toEqual([]);
+    });
+
+    it('returns everything for an empty or whitespace-only name', async () => {
+      const { filterMembersByName } = await loadModule();
+      expect(ids(filterMembersByName(body, '   '))).toEqual(['1', '2', '3']);
+    });
+
+    it('does not match or throw on null fields', async () => {
+      const { filterMembersByName } = await loadModule();
+      expect(ids(filterMembersByName(body, 'null'))).toEqual([]);
+    });
+
+    it('keeps other top-level fields', async () => {
+      const { filterMembersByName } = await loadModule();
+      expect((filterMembersByName(body, 'jane') as any)['@odata.count']).toBe(3);
+    });
+
+    it('returns non-collection input unchanged', async () => {
+      const { filterMembersByName } = await loadModule();
+      expect(filterMembersByName('plain', 'x')).toBe('plain');
+      expect(filterMembersByName({ id: '1' }, 'x')).toEqual({ id: '1' });
+    });
+  });
+
+  describe('member name filter (tool wiring)', () => {
+    const membersBody = {
+      value: [
+        { id: '1', displayName: 'Jane Doe', email: 'jane@contoso.com' },
+        { id: '2', displayName: 'John Smith', email: 'jsmith@contoso.com' },
+        { id: '3', displayName: null, email: null },
+      ],
+      '@odata.count': 3,
+    };
+    const page = (b: unknown) => ({ content: [{ type: 'text', text: JSON.stringify(b) }] });
+    const ids = (result: any) => JSON.parse(result.content[0].text).value.map((m: any) => m.id);
+
+    async function run(
+      args: Record<string, unknown>,
+      responses: any[] = [page(membersBody)],
+      alias = 'list-team-members',
+      path = '/teams/{team-id}/members',
+      outputFormat: 'json' | 'toon' = 'json'
+    ) {
+      mockEndpoints.push(makeEndpoint({ alias, path }));
+      mockEndpointsJson = [makeConfig({ toolName: alias, pathPattern: path, nameFilter: true })];
+      const graphClient = createMockGraphClient(responses, outputFormat);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+      const result = await server.tools.get(alias)!.handler({ 'team-id': 't1', ...args });
+      return { result, graphClient };
+    }
+
+    it('filters list-team-members by name', async () => {
+      const { result } = await run({ name: 'jane' });
+      expect(ids(result)).toEqual(['1']);
+    });
+
+    it('filters list-chat-members by email', async () => {
+      const { result } = await run(
+        { 'chat-id': 'c1', name: 'jsmith' },
+        [page(membersBody)],
+        'list-chat-members',
+        '/chats/{chat-id}/members'
+      );
+      expect(ids(result)).toEqual(['2']);
+    });
+
+    it('does not send name to Graph', async () => {
+      const { graphClient } = await run({ name: 'jane' });
+      expect(graphClient.graphRequest.mock.calls[0][0]).not.toContain('name');
+    });
+
+    it('returns the full list for a whitespace-only name', async () => {
+      const { result } = await run({ name: '  ' });
+      expect(ids(result)).toEqual(['1', '2', '3']);
+    });
+
+    it('leaves an error response untouched', async () => {
+      const err = { content: [{ type: 'text', text: '{"error":"nope"}' }], isError: true };
+      const { result } = await run({ name: 'jane' }, [err]);
+      expect(result.content[0].text).toBe('{"error":"nope"}');
+    });
+
+    it('keeps @odata.count as the unfiltered total', async () => {
+      const { result } = await run({ name: 'jane' });
+      expect(JSON.parse(result.content[0].text)['@odata.count']).toBe(3);
+    });
+
+    it('filters after fetchAllPages merges the pages', async () => {
+      const { result } = await run({ name: 'ann', fetchAllPages: true }, [
+        page({
+          value: [{ id: '1', displayName: 'Ann', email: 'a@x.com' }],
+          '@odata.nextLink': 'https://graph.microsoft.com/v1.0/teams/t1/members?$skiptoken=x',
+        }),
+        page({
+          value: [
+            { id: '2', displayName: 'Bob', email: 'b@x.com' },
+            { id: '3', displayName: 'Annette', email: 'n@x.com' },
+          ],
+        }),
+      ]);
+      expect(ids(result)).toEqual(['1', '3']);
+    });
+
+    it('matches only fields that survive $select projection', async () => {
+      const { result } = await run({ select: 'id,displayName', name: 'contoso' });
+      expect(ids(result)).toEqual([]);
+    });
+
+    describe('under --toon', () => {
+      // The mock serialize() prefixes TOON: so a filter that parses serialized output throws
+      const parseToon = (result: any) => JSON.parse(result.content[0].text.replace(/^TOON:/, ''));
+      const toon = (args: Record<string, unknown>, responses = [page(membersBody)]) =>
+        run(args, responses, 'list-team-members', '/teams/{team-id}/members', 'toon');
+
+      it('filters when no projection or merge applies', async () => {
+        const { result } = await toon({ name: 'jane' });
+        expect(parseToon(result).value.map((m: any) => m.id)).toEqual(['1']);
+      });
+
+      it('filters when $select projects the body', async () => {
+        const { result } = await toon({ select: 'id,displayName', name: 'jane' });
+        expect(parseToon(result).value).toEqual([{ id: '1', displayName: 'Jane Doe' }]);
+      });
+
+      it('filters after fetchAllPages merges the pages', async () => {
+        const { result } = await toon({ name: 'ann', fetchAllPages: true }, [
+          page({
+            value: [{ id: '1', displayName: 'Ann', email: 'a@x.com' }],
+            '@odata.nextLink': 'https://graph.microsoft.com/v1.0/teams/t1/members?$skiptoken=x',
+          }),
+          page({
+            value: [
+              { id: '2', displayName: 'Bob', email: 'b@x.com' },
+              { id: '3', displayName: 'Annette', email: 'n@x.com' },
+            ],
+          }),
+        ]);
+        expect(parseToon(result).value.map((m: any) => m.id)).toEqual(['1', '3']);
+      });
+    });
+
+    it('still matches a projected field', async () => {
+      const { result } = await run({ select: 'id,displayName', name: 'jane' });
+      expect(JSON.parse(result.content[0].text).value).toEqual([
+        { id: '1', displayName: 'Jane Doe' },
+      ]);
     });
   });
 });

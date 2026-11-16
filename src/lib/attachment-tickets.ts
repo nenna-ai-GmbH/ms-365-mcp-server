@@ -121,20 +121,37 @@ export type TicketIdentity =
   | { readonly kind: 'request-token'; readonly accessToken: string };
 
 /**
+ * What Graph's metadata said about a mail or event attachment when the ticket was minted.
+ * Plain data; the redemption route decides whether to use it.
+ */
+export type DownloadProbe = {
+  readonly probedContentType?: string;
+  readonly probedName?: string;
+};
+
+/** What Graph does when the drive folder already has a file with the uploaded name. */
+export type DriveConflictBehavior = 'fail' | 'replace' | 'rename';
+
+/**
  * What redeeming the ticket does. A download ticket authorises one GET of
  * `target`; an upload ticket authorises one PUT of a file that becomes an
  * attachment in the `target` collection (a draft message's or an event's
- * `/attachments`). Two kinds rather than a flag so a redemption handler has to
- * pick the branch it was written for and cannot serve the other by accident.
+ * `/attachments`), or, when `drive` is set, a file in the `target` drive folder.
+ * Two kinds rather than a flag so a redemption handler has to pick the branch
+ * it was written for and cannot serve the other by accident.
  */
 export type TicketPurpose =
-  | { readonly purpose: 'download' }
+  | ({ readonly purpose: 'download' } & DownloadProbe)
   | {
       readonly purpose: 'upload';
       /** Attachment name as Graph will store it. */
       readonly name: string;
       /** MIME type recorded on the attachment. */
       readonly contentType: string;
+      /** Content-ID that makes the attachment inline; absent for a regular attachment. */
+      readonly contentId?: string;
+      /** Set when `target` is a drive folder rather than an attachments collection. */
+      readonly drive?: { readonly conflictBehavior: DriveConflictBehavior };
     };
 
 export type AttachmentTicket = TicketIdentity &
@@ -146,7 +163,12 @@ export type AttachmentTicket = TicketIdentity &
   };
 
 /** Upload metadata a minting tool supplies; the store adds nothing to it. */
-export type UploadSpec = { readonly name: string; readonly contentType: string };
+export type UploadSpec = {
+  readonly name: string;
+  readonly contentType: string;
+  readonly contentId?: string;
+  readonly drive?: { readonly conflictBehavior: DriveConflictBehavior };
+};
 
 /**
  * Cap on live tickets. A ticket is a few KB at most, the token being nearly all
@@ -201,19 +223,27 @@ export class AttachmentTicketStore {
   mint(
     target: string,
     accountName: string | undefined,
-    nowMs: number = Date.now()
+    nowMs: number = Date.now(),
+    probe: DownloadProbe = {}
   ): { id: string; expiresAtMs: number } {
-    return this.add(target, { kind: 'server-account', accountName }, nowMs);
+    return this.add(target, { kind: 'server-account', accountName }, nowMs, {
+      purpose: 'download',
+      ...probe,
+    });
   }
 
   /** Mint a ticket redeemed with `accessToken` and nothing else. */
   mintWithToken(
     target: string,
     accessToken: string,
-    nowMs: number = Date.now()
+    nowMs: number = Date.now(),
+    probe: DownloadProbe = {}
   ): { id: string; expiresAtMs: number } {
     if (!accessToken) throw new Error('A request-token ticket needs a token');
-    return this.add(target, { kind: 'request-token', accessToken }, nowMs);
+    return this.add(target, { kind: 'request-token', accessToken }, nowMs, {
+      purpose: 'download',
+      ...probe,
+    });
   }
 
   /** Mint an upload ticket attached as this server's own token for `accountName`. */

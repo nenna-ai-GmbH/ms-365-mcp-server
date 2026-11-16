@@ -2,6 +2,7 @@ import { Command, Option } from 'commander';
 import { readFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { readEnabledToolsFromFile } from './lib/enabled-tools-file.js';
 import { assertSignoffMarkersVisible } from './lib/message-signoff.js';
 import { assertUploadDirsAbsolute } from './lib/upload-dirs.js';
 import { getCombinedPresetPattern, listPresets, presetRequiresOrgMode } from './tool-categories.js';
@@ -52,7 +53,7 @@ program
   )
   .option(
     '--enable-attachment-urls',
-    'HTTP mode only. Let get-download-url mint a short-TTL, single-use URL served by this server for Graph byte resources that expose no pre-authenticated URL of their own (mail and event attachments, meeting recordings, other $value endpoints). Also adds get-download-url to any --preset that lacks it (except teams-write). Requires MS365_MCP_ATTACHMENT_URL_BASE; MS365_MCP_ATTACHMENT_URL_KEY (or _KEY_FILE) is optional and adds an HMAC signature for fetchers that verify one'
+    'HTTP mode only. Let get-download-url mint a short-TTL, single-use URL served by this server for Graph byte resources that expose no pre-authenticated URL of their own (mail and event attachments, meeting recordings, other $value endpoints), and a short one for OneDrive/SharePoint files too; get-upload-url then also takes drive folders. Also adds get-download-url to any --preset that lacks it (except teams-write). Requires MS365_MCP_ATTACHMENT_URL_BASE; MS365_MCP_ATTACHMENT_URL_KEY (or _KEY_FILE) is optional and adds an HMAC signature for fetchers that verify one'
   )
   .option(
     '--attachment-port <port>',
@@ -65,6 +66,10 @@ program
   .option(
     '--enabled-tools <pattern>',
     'Filter tools using regex pattern (e.g., "excel|contact" to enable Excel and Contact tools)'
+  )
+  .option(
+    '--enabled-tools-file <path>',
+    'Filter tools using a file with one regex per line (same semantics as --enabled-tools; blank lines and whole-line # comments ignored). Overrides --enabled-tools; overridden by --preset. Equivalent env var: ENABLED_TOOLS_FILE.'
   )
   .option(
     '--allowed-scopes <scopes>',
@@ -89,17 +94,32 @@ program
     'Enable organization/work mode from start (includes Teams, SharePoint, etc.)'
   )
   .option('--work-mode', 'Alias for --org-mode')
+  .option(
+    '--app-mode',
+    'Use application permissions with no signed-in user. stdio only. Needs one credential: MS365_MCP_CLIENT_SECRET, MS365_MCP_CLIENT_CERTIFICATE_PATH or MS365_MCP_FEDERATED_TOKEN_FILE (with your own app registration and MS365_MCP_TENANT_ID), or MS365_MCP_MANAGED_IDENTITY on an Azure host. Only tools that work with application permissions are offered.'
+  )
   .option('--force-work-scopes', 'Backwards compatibility alias for --org-mode (deprecated)')
   .option('--toon', '(experimental) Enable TOON output format for 30-60% token reduction')
+  .option(
+    '--eager-tools <names>',
+    'With --discovery, also expose these comma-separated exact Graph or utility tool names directly. All enabled tools remain discoverable. Env: MS365_MCP_EAGER_TOOLS.'
+  )
   .option('--discovery', 'Enable runtime tool discovery and loading (experimental feature)')
-  .option('--cloud <type>', 'Microsoft cloud environment: global (default) or china (21Vianet)')
+  .option(
+    '--cloud <type>',
+    'Microsoft cloud environment: global (default), china (21Vianet) or gcc-high (US Government GCC High)'
+  )
   .option(
     '--enable-dynamic-registration',
-    'Enable OAuth Dynamic Client Registration endpoint (kept for backwards compatibility, now enabled by default in HTTP mode)'
+    'Turn on OAuth Dynamic Client Registration in HTTP mode (off by default; the MCP spec deprecated it in favour of Client ID Metadata Documents). Needed by clients that only support DCR, such as Open WebUI. Equivalent env var: MS365_MCP_ENABLE_DCR=true.'
   )
   .option(
     '--no-dynamic-registration',
-    'Disable OAuth Dynamic Client Registration endpoint in HTTP mode. Equivalent env var: MS365_MCP_DISABLE_DCR=true.'
+    'Keep OAuth Dynamic Client Registration off, even when --enable-dynamic-registration or MS365_MCP_ENABLE_DCR is set. Equivalent env var: MS365_MCP_DISABLE_DCR=true.'
+  )
+  .option(
+    '--no-client-metadata-documents',
+    "Turn off OAuth Client ID Metadata Documents in HTTP mode: they are no longer advertised, and https client_ids are passed through like any other. For servers that cannot reach the client's host directly (proxy-only or allowlisted egress); Claude then falls back to Dynamic Client Registration, so turn that on too. Equivalent env var: MS365_MCP_DISABLE_CIMD=true."
   )
   .option(
     '--auth-browser',
@@ -120,6 +140,10 @@ program
   .option(
     '--http-local-file-tools',
     "In HTTP mode, also register the local file tools: download-bytes-to-file, which writes files on the server as the server's user, and upload-attachment-from-file, which reads files from the MS365_MCP_UPLOAD_DIRS directories when that is set. Anyone who can reach the port can use them, so enable only on a single-user machine. Refused unless --http binds a loopback host with no --public-url and no --trust-proxy-auth."
+  )
+  .option(
+    '--blob-output',
+    'File download tools (get-mail-message-mime, get-shared-mailbox-message-mime, get-mail-attachment-content, get-shared-mailbox-attachment-content) answer an MCP EmbeddedResource with the file instead of base64 JSON in a text block. Off by default.'
   )
   .option(
     '--allow-unauthenticated-discovery',
@@ -163,6 +187,7 @@ export interface CommandOptions {
    */
   attachmentHost?: string;
   enabledTools?: string;
+  enabledToolsFile?: string;
   allowedScopes?: string;
   userFields?: string;
   extraScopes?: string;
@@ -170,17 +195,22 @@ export interface CommandOptions {
   listPresets?: boolean;
   listPermissions?: boolean;
   orgMode?: boolean;
+  appMode?: boolean;
   workMode?: boolean;
   forceWorkScopes?: boolean;
   toon?: boolean;
   discovery?: boolean;
+  eagerTools?: string[];
   cloud?: string;
   enableDynamicRegistration?: boolean;
   dynamicRegistration?: boolean;
+  /** False turns Client ID Metadata Documents off; anything else leaves them on. */
+  clientMetadataDocuments?: boolean;
   authBrowser?: boolean;
   obo?: boolean;
   trustProxyAuth?: boolean;
   httpLocalFileTools?: boolean;
+  blobOutput?: boolean;
   allowUnauthenticatedDiscovery?: boolean;
   publicUrl?: string;
   /** @deprecated use publicUrl */
@@ -204,6 +234,10 @@ export function parseArgs(): CommandOptions {
     process.env.MS365_MCP_MESSAGE_SIGNOFF_SUFFIX = '';
     process.env.MS365_MCP_MESSAGE_SIGNOFF_PREFIX = '';
   }
+  // Same for blob output, which graph-client.ts reads per download
+  if (options.blobOutput) {
+    process.env.MS365_MCP_BLOB_OUTPUT = 'true';
+  }
   // Markup in a marker is allowed (e.g. a coloured <span>), but refuse to start
   // with one that renders as empty text - html sends would look unsigned.
   assertSignoffMarkersVisible();
@@ -213,6 +247,38 @@ export function parseArgs(): CommandOptions {
     const presets = listPresets();
     console.log(JSON.stringify({ presets }, null, 2));
     process.exit(0);
+  }
+
+  // Tool filter layering (later wins): --enabled-tools → --enabled-tools-file →
+  // --preset → ENABLED_TOOLS → ENABLED_TOOLS_FILE.
+  if (typeof options.enabledToolsFile === 'string') {
+    try {
+      options.enabledTools = readEnabledToolsFromFile(options.enabledToolsFile);
+    } catch (error) {
+      console.error(`Error: ${(error as Error).message}`);
+      process.exit(1);
+    }
+  }
+  delete options.enabledToolsFile;
+
+  const eagerValue = options.eagerTools ?? (process.env.MS365_MCP_EAGER_TOOLS?.trim() || undefined);
+  if (eagerValue !== undefined) {
+    if (!options.discovery) throw new Error('--eager-tools requires --discovery');
+    const names = String(eagerValue)
+      .split(',')
+      .map((name) => name.trim());
+    if (names.some((name) => name === ''))
+      throw new Error('--eager-tools requires non-empty exact tool names');
+    options.eagerTools = [...new Set(names)];
+  }
+
+  if (process.env.MS365_MCP_APP_MODE === 'true' || process.env.MS365_MCP_APP_MODE === '1') {
+    options.appMode = true;
+  }
+
+  // App mode is tenant-only, so the work-account guidance and presets apply
+  if (options.appMode) {
+    options.orgMode = true;
   }
 
   if (options.preset) {
@@ -241,6 +307,15 @@ export function parseArgs(): CommandOptions {
 
   if (process.env.ENABLED_TOOLS) {
     options.enabledTools = process.env.ENABLED_TOOLS;
+  }
+
+  if (process.env.ENABLED_TOOLS_FILE) {
+    try {
+      options.enabledTools = readEnabledToolsFromFile(process.env.ENABLED_TOOLS_FILE);
+    } catch (error) {
+      console.error(`Error: ${(error as Error).message}`);
+      process.exit(1);
+    }
   }
 
   if (options.allowedScopes === undefined && process.env.MS365_MCP_ALLOWED_SCOPES !== undefined) {
@@ -372,19 +447,16 @@ export function parseArgs(): CommandOptions {
     options.toon = true;
   }
 
-  // Dynamic registration defaults to true in HTTP mode.
-  // CLI flags `--enable-dynamic-registration` / `--no-dynamic-registration` take
-  // precedence; otherwise `MS365_MCP_DISABLE_DCR=true|1` opts the deployment out
-  // (allows env-var-only configuration in container platforms without modifying
-  // process args).
+  // Dynamic Client Registration is off by default in HTTP mode; Client ID
+  // Metadata Documents replace it. `--enable-dynamic-registration` or
+  // MS365_MCP_ENABLE_DCR turn it on, and `--no-dynamic-registration` or
+  // MS365_MCP_DISABLE_DCR keep it off whatever else is set.
   if (options.http) {
-    const dcrDisabledByEnv =
-      process.env.MS365_MCP_DISABLE_DCR === 'true' || process.env.MS365_MCP_DISABLE_DCR === '1';
-    if (options.dynamicRegistration === false || dcrDisabledByEnv) {
-      options.enableDynamicRegistration = false;
-    } else {
-      options.enableDynamicRegistration = true;
-    }
+    const envFlag = (name: string) => process.env[name] === 'true' || process.env[name] === '1';
+    const forcedOff = options.dynamicRegistration === false || envFlag('MS365_MCP_DISABLE_DCR');
+    const turnedOn = options.enableDynamicRegistration === true || envFlag('MS365_MCP_ENABLE_DCR');
+    options.enableDynamicRegistration = turnedOn && !forcedOff;
+    if (envFlag('MS365_MCP_DISABLE_CIMD')) options.clientMetadataDocuments = false;
   }
 
   if (process.env.MS365_MCP_OBO === 'true' || process.env.MS365_MCP_OBO === '1') {
